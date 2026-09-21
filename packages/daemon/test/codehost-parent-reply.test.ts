@@ -48,6 +48,60 @@ function hook(provider: 'github' | 'gitlab' | 'gitea'): RdMsgHook {
 }
 
 describe('code-host parent replies', () => {
+  it.each(['gitlab', 'gitea'] as const)(
+    'pins the instance when replaying a legacy %s hook target',
+    async (provider) => {
+      const root = scaffold([PARENT])
+      const seed = new Daemon({ root, hostFactory: scriptedHosts({ [PARENT]: () => 'unused' }).factory })
+      await seed.start()
+      const delivery = hook(provider)
+      const target = { provider, hookId: 'hook-1', repo: '123', number: 42, subjectKind: 'issue' }
+      const key = sessionKey('hook', `${provider}:123`, '42', PARENT, `${provider}:123`)
+      await (seed as any).store.appendInbox({
+        id: 'legacy-hook',
+        sessionKey: key,
+        agentId: PARENT,
+        enqueuedAt: '1',
+        loopGuardCounted: 1,
+        hookContext: JSON.stringify({ ...delivery, githubReply: target }),
+        posterPublishState: 'not_started',
+        msg: JSON.stringify({
+          msgId: 'legacy-hook',
+          source: 'hook',
+          platform: 'hook',
+          channel: `${provider}:123`,
+          thread: '42',
+          transportScope: `${provider}:123`,
+          sender: { id: 'hook', isBot: true },
+          text: 'Legacy hook.',
+          mentionedBots: [],
+          isDm: false
+        })
+      })
+      await seed.stop()
+      const runtime = scriptedHosts({ [PARENT]: () => 'Resumed.' })
+      const restarted = new Daemon({ root, hostFactory: runtime.factory })
+      const cp = {
+        ...fakeCpClient(),
+        emitEventSession: vi.fn(),
+        emitHookReport: vi.fn(async () => 'acknowledged' as const)
+      }
+      ;(restarted as any).cpClient = cp
+      ;(restarted as any).githubReviews.makeCodeHostReply = vi.fn(() => ({
+        poster: { publish: vi.fn(async () => {}) },
+        collector: new GithubReplyCollector()
+      }))
+      try {
+        await restarted.start()
+        await vi.waitFor(() => expect(cp.emitHookReport).toHaveBeenCalledTimes(1), WAIT)
+        const parent = await (restarted as any).store.getSession(key)
+        expect(JSON.parse(parent.codeHostReplyTarget)).toMatchObject({ ...target, host: `https://${provider}.com` })
+      } finally {
+        await restarted.stop()
+      }
+    }
+  )
+
   it.each(['github', 'gitlab', 'gitea'] as const)(
     'resumes a %s parent and publishes only its answer after an explicit child report',
     async (provider) => {

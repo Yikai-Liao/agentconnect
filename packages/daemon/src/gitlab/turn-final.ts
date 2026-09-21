@@ -3,6 +3,7 @@
 import { GITLAB_DEFAULT_BASE_URL, type RdMsgHook } from '@agentconnect.md/protocol'
 import type {
   CodeHostDelivery,
+  CodeHostReplySource,
   CodeHostEffectLease,
   CodeHostFinalPoster,
   CodeHostFinalPosterDeps,
@@ -25,7 +26,7 @@ export interface GitlabTurnFinalHost {
 }
 
 /** §14.1 rides the same pipe as GitHub: `repo` is the numeric project id and `number` the subject IID; pushes have no thread and stay silent. */
-function replyTarget(msg: RdMsgHook): CodeHostReplyTarget | undefined {
+function replyTarget(msg: CodeHostReplySource): CodeHostReplyTarget | undefined {
   const gitlab = msg.gitlab
   if (!gitlab || gitlab.target.kind === 'push') return undefined
   return {
