@@ -614,7 +614,8 @@ export type RdAck = z.infer<typeof RdAck>
 /**
  * What kind of delivery a cross-daemon agent message is
  * (send-message-routing-rework.md §8.3). It selects the target's AUTOMATIC-OUTPUT
- * behavior; it never changes authorization, which stays the caller/target policy pair.
+ * behavior. Ordinary wakes require directional call policy; parent replies require
+ * source-validated origin authority, authenticated same-org routing, and target-session ownership.
  *
  *  - `wake` — the ordinary postless `toAgent` call. The woken child is headless in the
  *    existing sense: nothing is posted to any channel on its behalf.
@@ -725,8 +726,8 @@ export type RdAgentMsg = z.infer<typeof RdAgentMsg>
  * owning daemon, replacing the untrusted `claimedFromAgentId` with a TRUSTED caller
  * claim the relay minted after snapshot validation: `trustedFromAgentId` + the `orgId`
  * the caller's own directory entry places it in (never an org the frame asserted). The
- * target daemon TERMINAL-verifies this claim + both directional policies against its
- * LOCAL snapshot (defense in depth, §2.5 #4) before dispatching `source:'agent'`.
+ * target daemon verifies the same-org claim against its LOCAL snapshot, then checks
+ * directional policies for wakes or exact session ownership for origin-authorized replies.
  *
  * What `coords` is and is NOT: it is the ASSERTED delivery coordinate, not evidence of a
  * shared channel — A2A authorization is channel-free (postless delivery, #854), so caller and
@@ -800,7 +801,7 @@ export const RdAgentMsgFwd = z.object({
   // membership gate for lineage replies: nothing is keyed or created from
   // `coords` on this path, so the aliasing threat that gate closes is absent,
   // and membership would wrongly reject a replier that does not share the
-  // origin's channel. Org + directional policy and the session capability
+  // origin's channel. Authenticated org routing and the origin session capability
   // (possession of the id + ownership by `toAgentId`) still gate delivery.
   lineageReplyTo: z.string().min(1).optional(),
   // Forwarded verbatim from RdAgentMsg (session-concept §5.4): the caller's request that the woken

@@ -13155,12 +13155,11 @@ export class Daemon {
     const { agentId, callMeta } = entry
     // Only trusted hook ingress establishes an output target; console turns and children cannot replace it.
     if (entry.msg.source === 'hook' && entry.msg.platform === 'hook') {
-      // An older retained hook may lack the instance pin; recover it from trusted metadata before persisting.
-      const target =
-        entry.githubReply && entry.hookContext
-          ? { ...entry.githubReply, ...turnFinalFor(entry.githubReply).replyTarget(entry.hookContext) }
-          : entry.githubReply
-      await this.store.setSessionCodeHostReplyTarget(key, agentId, target ? JSON.stringify(target) : null)
+      await this.store.setSessionCodeHostReplyTarget(
+        key,
+        agentId,
+        entry.githubReply ? JSON.stringify(entry.githubReply) : null
+      )
     }
     // session/new|load may emit title/usage metadata before the local row exists.
     // Replay only after Pending owns the live sink so persisted and streamed state
@@ -19702,6 +19701,10 @@ export class Daemon {
         codeHostReply = row.codeHostReplyTarget
           ? (JSON.parse(row.codeHostReplyTarget) as CodeHostReplyTarget)
           : hookContext?.githubReply
+        // Restore legacy instance pins before dispatch constructs any provider lease or poster.
+        if (codeHostReply && hookContext) {
+          codeHostReply = { ...codeHostReply, ...turnFinalFor(codeHostReply).replyTarget(hookContext) }
+        }
       } catch (err) {
         this.log.warn(`durable inbox: skipping corrupt row ${row.id}: ${(err as Error).message}`)
         continue

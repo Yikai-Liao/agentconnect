@@ -49,7 +49,7 @@ function hook(provider: 'github' | 'gitlab' | 'gitea'): RdMsgHook {
 
 describe('code-host parent replies', () => {
   it.each(['gitlab', 'gitea'] as const)(
-    'pins the instance when replaying a legacy %s hook target',
+    'refuses publication to a changed instance when replaying a legacy %s hook target',
     async (provider) => {
       const root = scaffold([PARENT])
       const seed = new Daemon({ root, hostFactory: scriptedHosts({ [PARENT]: () => 'unused' }).factory })
@@ -87,17 +87,27 @@ describe('code-host parent replies', () => {
         emitHookReport: vi.fn(async () => 'acknowledged' as const)
       }
       ;(restarted as any).cpClient = cp
-      ;(restarted as any).githubReviews.makeCodeHostReply = vi.fn(() => ({
-        poster: { publish: vi.fn(async () => {}) },
-        collector: new GithubReplyCollector()
-      }))
+      const mint = vi.fn(async () => ({ token: 'test-token' }))
+      Object.assign((restarted as any).githubReviews.turnFinalHost, {
+        getGitlabPostToken: mint,
+        getGiteaPostToken: mint,
+        gitlabHostFor: () => 'https://replacement.example.test',
+        giteaHostFor: () => 'https://replacement.example.test'
+      })
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected provider request'))
       try {
         await restarted.start()
         await vi.waitFor(() => expect(cp.emitHookReport).toHaveBeenCalledTimes(1), WAIT)
         const parent = await (restarted as any).store.getSession(key)
         expect(JSON.parse(parent.codeHostReplyTarget)).toMatchObject({ ...target, host: `https://${provider}.com` })
+        expect(mint).not.toHaveBeenCalled()
+        expect(fetchSpy).not.toHaveBeenCalled()
+        expect(cp.emitHookReport).toHaveBeenCalledWith(
+          expect.objectContaining({ status: 'failed', reason: 'note_publish_failed:token_unavailable' })
+        )
       } finally {
         await restarted.stop()
+        fetchSpy.mockRestore()
       }
     }
   )
@@ -232,12 +242,22 @@ async function roundTrip(provider: 'github' | 'gitlab' | 'gitea', explicit: bool
     emitEventSession: vi.fn(),
     emitHookReport: vi.fn(async () => 'acknowledged' as const)
   }
-  const publish = vi.fn(async () => {})
-  const makeReply = vi.fn(() => ({ poster: { publish }, collector: new GithubReplyCollector() }))
   await daemon.start()
   const d = daemon as any
   d.cpClient = cp
-  d.githubReviews.makeCodeHostReply = makeReply
+  Object.assign(d.githubReviews.turnFinalHost, {
+    getPostToken: async () => ({ token: 'test-token' }),
+    getGitlabPostToken: async () => ({ token: 'test-token' }),
+    getGiteaPostToken: async () => ({ token: 'test-token' })
+  })
+  const requests: { url: string; body: Record<string, unknown> }[] = []
+  const localFetch = globalThis.fetch
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+    const hostname = new URL(String(url)).hostname
+    if (hostname === '127.0.0.1' || hostname === 'localhost') return localFetch(url, init)
+    requests.push({ url: String(url), body: JSON.parse(String(init?.body ?? '{}')) })
+    return new Response(JSON.stringify({ id: 9001, html_url: 'https://example.test/comment/9001' }), { status: 201 })
+  })
   seedCallPolicy(daemon, [PARENT, CHILD], {
     [PARENT]: {
       callPolicy: 'selected',
@@ -259,21 +279,28 @@ async function roundTrip(provider: 'github' | 'gitlab' | 'gitea', explicit: bool
     const [listedParent] = await d.store.listSessions(PARENT)
     const parent = await d.store.getSession(listedParent.key)
     expect(JSON.parse(parent.codeHostReplyTarget)).toMatchObject({ provider, hookId: 'hook-1', number: 42 })
-    // The poster itself filters AC_NO_RESPONSE; observe only the resumed turn below.
-    publish.mockClear()
     releaseChild()
-    await vi.waitFor(() => expect(publish).toHaveBeenCalledWith('Public summary from the parent.'), WAIT)
+    const replies = () => requests.filter((r) => typeof r.body.body === 'string')
+    await vi.waitFor(() => expect(replies()).toHaveLength(1), WAIT)
     await settle()
     if (explicit) expect(childResult).toMatchObject({ ok: true })
     expect(parentInputs).toHaveLength(2)
     expect(parentInputs[1]).toContain('Private child findings.')
     expect(parentInputs[1]?.includes('[inferred reply]')).toBe(!explicit)
-    expect(publish).toHaveBeenCalledTimes(1)
-    expect(makeReply.mock.calls.at(-1)).toEqual([PARENT, JSON.parse(parent.codeHostReplyTarget), parent.acpSessionId])
+    const endpoints = {
+      github: 'https://api.github.com/repos/acme/project/issues/42/comments',
+      gitlab: 'https://gitlab.com/api/v4/projects/123/issues/42/notes',
+      gitea: 'https://gitea.com/api/v1/repos/acme/project/issues/42/comments'
+    }
+    expect(replies()).toEqual([
+      { url: endpoints[provider], body: { body: expect.stringContaining('Public summary from the parent.') } }
+    ])
+    expect(JSON.stringify(requests)).not.toContain('Private child findings.')
     // A report resumes an ordinary turn, not the completed hook or its formal-review authority.
     expect(cp.emitHookReport).toHaveBeenCalledTimes(1)
   } finally {
     releaseChild()
     await daemon.stop()
+    fetchSpy.mockRestore()
   }
 }
