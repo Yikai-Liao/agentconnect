@@ -87,6 +87,42 @@ const dropTranscriptOrg = (db: DatabaseSync): void => {
   `)
 }
 
+it('keeps a parent output target agent-owned and carries a separate publication fence in its inbox', async () => {
+  const s = await store()
+  const parent = {
+    key: 'parent',
+    agentId: 'bot-a',
+    platform: 'hook',
+    channel: 'github:123',
+    thread: '42',
+    acpSessionId: 'acp-parent',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1
+  }
+  await s.upsertSession(parent)
+  const target = JSON.stringify({ provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 })
+  await s.setSessionCodeHostReplyTarget('parent', 'bot-b', target)
+  expect((await s.getSession('parent'))?.codeHostReplyTarget).toBeNull()
+  await s.setSessionCodeHostReplyTarget('parent', 'bot-a', target)
+  await s.upsertSession({ ...parent, updatedAt: 2 })
+  expect((await s.getSession('parent'))?.codeHostReplyTarget).toBe(target)
+  await s.appendInbox({
+    id: 'report',
+    sessionKey: 'parent',
+    agentId: 'bot-a',
+    msg: '{}',
+    enqueuedAt: '1',
+    codeHostReplyTarget: target,
+    posterPublishState: 'not_started'
+  })
+  expect(await s.updateInboxHookState('report', null, 'in_flight')).toBe(true)
+  expect(await s.listInboxBySessionKeyFifo()).toMatchObject([
+    { codeHostReplyTarget: target, hookContext: null, posterPublishState: 'in_flight' }
+  ])
+  await s.close()
+})
+
 describe.skipIf(pg)('LocalStore schema versioning', () => {
   const userVersion = (path: string): number => {
     const db = new DatabaseSync(path)

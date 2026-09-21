@@ -214,7 +214,7 @@ export interface SessionRecord {
   platform: string
   channel: string
   thread: string
-  /** Opaque physical-bot scope for transcript/session lookup isolation. */
+  /** Identity boundary for transcript/session isolation: a physical chat account or a code-host repository. */
   transportScope?: string | null
   /** Trusted code-host output coordinates, independent of a hook run's review authority. */
   codeHostReplyTarget?: string | null

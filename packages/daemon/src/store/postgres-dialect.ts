@@ -38,6 +38,7 @@ export const canonicalColumns = [
   'childSessionId',
   'claimedAt',
   'claimedBy',
+  'codeHostReplyTarget',
   'completedAt',
   'connectionId',
   'connectionRevision',

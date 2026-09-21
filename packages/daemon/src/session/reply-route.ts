@@ -13,6 +13,7 @@ export function sessionReplyRoute(
   integrationForSession: (agentId: string, platform: string, scope?: string | null) => string | undefined
 ): SessionReplyRoute | undefined {
   if (session.platform === 'hook' && isCodeHostProvider(session.transportScope?.split(':', 1)[0])) {
+    // Legacy rows can receive private reports; only trusted hook ingress can establish their public output target.
     return session.codeHostReplyTarget
       ? { codeHostReply: JSON.parse(session.codeHostReplyTarget) as CodeHostReplyTarget }
       : {}
