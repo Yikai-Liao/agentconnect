@@ -543,6 +543,26 @@ The parent session is therefore resumed as an ORDINARY turn:
 - correlation, hop count, orchestration report recording, memory behavior, and
   the per-session serial gate remain unchanged.
 
+For code-host sessions, a repository scope (`github:<id>`, `gitlab:<id>`, or
+`gitea:<id>`) identifies the conversation; it is not a chat integration ID.
+Trusted hook ingress persists the ordinary reply target on the session. A
+parent reply copies that target into its own durable inbox row, with its own
+publication fence. Restart replay preserves both. It does not reopen the
+completed hook run or restore formal-review authority. GitLab and Gitea targets
+also pin the provider instance; a changed instance binding refuses publication.
+
+Only a parent-session reply inherits this output target. A Console continuation
+of a hook session remains Console-only. Sessions created before the target was
+persisted can receive reports, but need a new trusted hook delivery to establish
+automatic code-host output; coordinates and publication authority are never
+reconstructed from prompt text.
+
+On both local and cross-daemon paths, origin-authorized replies require no reverse
+peer-visibility grant. The relay still binds the caller to its authenticated
+daemon and organization, and the receiving daemon resolves only an existing
+session owned by the target agent. Success is acknowledged after durable turn
+admission, not merely after finding the session.
+
 An earlier revision resumed the parent with `headless: true` to prevent a second
 copy of an answer the child had already delivered. That trade only holds when
 the child answered in the SAME conversation the parent would speak in. When the

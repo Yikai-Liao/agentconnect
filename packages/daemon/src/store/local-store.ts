@@ -216,6 +216,8 @@ export interface SessionRecord {
   thread: string
   /** Opaque physical-bot scope for transcript/session lookup isolation. */
   transportScope?: string | null
+  /** Trusted code-host output coordinates, independent of a hook run's review authority. */
+  codeHostReplyTarget?: string | null
   /** What the RUNTIME knows this session by, used on the ACP hop alone (§1.1). Null until it exists. */
   acpSessionId: string | null
   /** The session's OUTWARD identity (§1.1), minted when the slot resolves — so it exists before
@@ -577,6 +579,8 @@ export interface InboxRow {
   /** JSON.stringify(HookDispatchContext), or null for ordinary turns. This is
    * daemon-private trusted metadata; prompt excerpts remain in `msg`. */
   hookContext?: string | null
+  /** The admitted turn's code-host output target, independent of hook lifecycle state. */
+  codeHostReplyTarget?: string | null
   /** Single-attempt GitHub final-poster state, durable across daemon restart. */
   posterPublishState?: 'not_started' | 'in_flight' | 'settled' | null
   /** A redacted, metadata-only HookReport retained as the durable dedup receipt
@@ -973,7 +977,7 @@ export const THREAD_PARTICIPATION_BACKFILL = `
       WHERE channel IS NOT NULL AND thread IS NOT NULL AND agentId IS NOT NULL
 `
 
-export const SCHEMA_VERSION = 22
+export const SCHEMA_VERSION = 23
 
 /**
  * Ordered in-place upgrades for a store created by an EARLIER daemon.
@@ -1168,10 +1172,13 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean }) => Promise<v
     await db.exec(THREAD_PARTICIPATION_SCHEMA)
     await db.exec(THREAD_PARTICIPATION_BACKFILL)
   },
-  // Append reservations (channel-session-mode.md §3.3). Nothing to backfill: no
-  // conversation is in `append` until an operator says so, and the first message there
-  // mints the coordinate.
-  async (db) => await db.exec(APPEND_RESERVATION_SCHEMA)
+  // Append reservations are minted when a conversation first receives a message in append mode.
+  async (db) => await db.exec(APPEND_RESERVATION_SCHEMA),
+  // Parent replies retain output coordinates without replaying a completed hook run.
+  async (db) => {
+    await db.exec('ALTER TABLE sessions ADD COLUMN codeHostReplyTarget TEXT')
+    await db.exec('ALTER TABLE inbox ADD COLUMN codeHostReplyTarget TEXT')
+  }
 ]
 
 // The list and the version are two halves of one fact: step `i` moves a database from
@@ -1273,7 +1280,7 @@ export class LocalStore {
       ${MEMORY_CONTINUATION_SCHEMA}
       CREATE TABLE IF NOT EXISTS sessions (
         key TEXT PRIMARY KEY, agentId TEXT, platform TEXT, channel TEXT, thread TEXT,
-        transportScope TEXT, acpSessionId TEXT, sessionId TEXT, state TEXT, lastDeliveredTs TEXT, updatedAt INTEGER,
+        transportScope TEXT, codeHostReplyTarget TEXT, acpSessionId TEXT, sessionId TEXT, state TEXT, lastDeliveredTs TEXT, updatedAt INTEGER,
         usage TEXT, muted INTEGER, triggeredBy TEXT, title TEXT, threadUrl TEXT, modelOverride TEXT,
         observedModel TEXT, observedModelSet INTEGER NOT NULL DEFAULT 0,
         effortOverride TEXT, permissionModeOverride TEXT, fastModeOverride INTEGER,
@@ -1508,6 +1515,7 @@ export class LocalStore {
         integrationId TEXT,
         callMeta TEXT,
         hookContext TEXT,
+        codeHostReplyTarget TEXT,
         posterPublishState TEXT,
         terminalReport TEXT,
         reportOwnerId TEXT,
@@ -1908,6 +1916,12 @@ export class LocalStore {
 
   async getSession(key: string): Promise<SessionRecord | undefined> {
     return (await this.db.prepare('SELECT * FROM sessions WHERE key = ?').get(key)) as SessionRecord | undefined
+  }
+
+  async setSessionCodeHostReplyTarget(key: string, agentId: string, target: string | null): Promise<void> {
+    await this.db
+      .prepare('UPDATE sessions SET codeHostReplyTarget = ? WHERE key = ? AND agentId = ?')
+      .run(target, key, agentId)
   }
 
   /**
@@ -5501,10 +5515,10 @@ export class LocalStore {
     const inserted = await this.db
       .prepare(
         `INSERT OR IGNORE INTO inbox
-          (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, posterPublishState,
+          (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, codeHostReplyTarget, posterPublishState,
             terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
          VALUES
-           (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
+           (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @codeHostReplyTarget, @posterPublishState,
             @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
       )
       .run({
@@ -5515,6 +5529,7 @@ export class LocalStore {
         integrationId: row.integrationId ?? null,
         callMeta: row.callMeta ?? null,
         hookContext: row.hookContext ?? null,
+        codeHostReplyTarget: row.codeHostReplyTarget ?? null,
         posterPublishState: row.posterPublishState ?? null,
         terminalReport: row.terminalReport ?? null,
         completedAt: row.completedAt ?? null,
@@ -5553,10 +5568,10 @@ export class LocalStore {
         tx
           .prepare(
             `INSERT OR IGNORE INTO inbox
-              (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, posterPublishState,
+              (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, codeHostReplyTarget, posterPublishState,
                 terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
              VALUES
-               (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @posterPublishState,
+               (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @codeHostReplyTarget, @posterPublishState,
                 @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
           )
           .run({
@@ -5567,6 +5582,7 @@ export class LocalStore {
             integrationId: r.integrationId ?? null,
             callMeta: r.callMeta ?? null,
             hookContext: r.hookContext ?? null,
+            codeHostReplyTarget: r.codeHostReplyTarget ?? null,
             posterPublishState: r.posterPublishState ?? null,
             terminalReport: r.terminalReport ?? null,
             completedAt: r.completedAt ?? null,
@@ -5592,7 +5608,7 @@ export class LocalStore {
 
   async updateInboxHookState(
     id: string,
-    hookContext: string,
+    hookContext: string | null,
     posterPublishState?: 'not_started' | 'in_flight' | 'settled'
   ): Promise<boolean> {
     const result = await this.db
@@ -5679,7 +5695,7 @@ export class LocalStore {
     const result = await this.db
       .prepare(
         `UPDATE inbox
-         SET msg = '{}', integrationId = NULL, callMeta = NULL, hookContext = NULL,
+         SET msg = '{}', integrationId = NULL, callMeta = NULL, hookContext = NULL, codeHostReplyTarget = NULL,
              posterPublishState = 'settled', terminalReport = @terminalReport,
              reportOwnerId = @ownerId, reportClaimedAt = @completedAt,
              completedAt = @completedAt, isQueueCmd = NULL

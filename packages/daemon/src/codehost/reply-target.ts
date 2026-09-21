@@ -13,6 +13,8 @@ export interface CodeHostReplyTarget {
   hookId: string
   /** The code host whose coordinates these are, and which owns this turn's one public reply. */
   provider: CodeHostProvider
+  /** Pin a configurable provider's instance when a later parent reply reuses these coordinates. */
+  host?: string
   /** GitLab names its subject (§14.1); GitHub reads the kind off its own trusted metadata. */
   subjectKind?: 'issue' | 'merge_request'
   /** GitHub: `owner/repo`. GitLab and Gitea: the numeric project/repository id — all are what the effect lease is scoped to. */

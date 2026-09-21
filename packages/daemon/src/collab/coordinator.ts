@@ -30,6 +30,8 @@ import {
 } from '../store/local-store.js'
 import { monotonicTs } from '../store/monotonic-ts.js'
 import { isNoResponseBody } from '../session/no-response.js'
+import { sessionReplyRoute } from '../session/reply-route.js'
+import type { CodeHostReplyTarget } from '../codehost/reply-target.js'
 import { isPlatformMemberId } from '../platforms/member-id.js'
 import { threadKeyForPost } from '../platforms/thread-keys.js'
 import type { NormalizedMessage } from '../messages/normalized.js'
@@ -106,7 +108,8 @@ export interface CollabTurnHost {
     opts?: {
       requireDurable?: boolean
       onAdmission?: (result: { accepted: boolean; reason?: string; duplicate?: boolean }) => void
-    }
+    },
+    codeHostReply?: CodeHostReplyTarget
   ): Promise<string | null>
   webchatTransport(): WebchatTransport
   /** The external audience of a session, by its logical key. */
@@ -816,11 +819,18 @@ export class CollabCoordinator {
     if (!authorizedOrigin || req.sessionId !== authorizedOrigin) {
       return { delivered: false, reason: 'not_authorized' }
     }
+    const failed = async (
+      reason: NonNullable<ReplyToSessionResult['reason']>,
+      targetSession?: string
+    ): Promise<ReplyToSessionResult> => {
+      await this.markChildParentReply(callerKey, req.sessionId, 'failed')
+      return { delivered: false, reason, ...(targetSession ? { targetSession } : {}) }
+    }
     // A reply is an agent-call — bound it by the same hop cap so a reply ping-pong can't run away.
     // A human-triggered turn has no inbound depth, so it starts the chain at 0.
     const sourceHopCount = inbound?.hopCount ?? 0
     if (hasReachedAgentCallHopLimit(sourceHopCount + 1)) {
-      return { delivered: false, reason: 'hop_limit' }
+      return failed('hop_limit')
     }
     // §5.3 step 3: replying into the origin inherits the origin turn's correlationId when present
     // (so a main-agent's orchestration closes without the worker knowing the id). Explicit wins;
@@ -863,23 +873,10 @@ export class CollabCoordinator {
     if (local) {
       const originOwner = local.agentId
       const originPlatform = local.platform
-      // Resolve the reply's output transport by the ORIGIN session's platform, not the
-      // agent's default integration. A multi-platform agent (e.g. Slack + Telegram) would
-      // otherwise post the reply through integrations[0]'s client, and a Telegram chat id
-      // sent via the Slack client fails with channel_not_found (the reply turn runs but its
-      // answer never reaches the origin channel).
-      // A channel-free hook/dream child's stored transportScope was derived from whichever
-      // integration the spawn side picked (requested-platform preferred, else the agent's
-      // FIRST integration), so the session-transport helper matches the scope across ALL
-      // integrations for those rows. Only the session KEY and the synthesized message are raw.
-      const integrationId = this.host.integrationIdForSessionTransport(
-        originOwner,
-        originPlatform,
-        local.transportScope
-      )
-      if (local.transportScope && !integrationId) {
-        return { delivered: false, targetSession: local.key, reason: 'not_found' }
-      }
+      // Local and remote replies resolve the parent's own sink while preserving its identity scope.
+      const route = sessionReplyRoute(local, (...args) => this.host.integrationIdForSessionTransport(...args))
+      if (!route) return failed('not_found', local.key)
+      const { integrationId, codeHostReply } = route
       const resolved = this.host.resolveCpAgent(originOwner, originPlatform)
       // §7: what stays invisible is the REPORT ITSELF — the child's body is injected into the
       // parent session's transcript and is never published to the platform (this function
@@ -938,7 +935,8 @@ export class CollabCoordinator {
         integrationId,
         this.host.webchatTransport().webchatWakeContext(originPlatform, local.channel),
         callMeta,
-        { onAdmission: (result) => settleAdmission(result) }
+        { requireDurable: true, onAdmission: (result) => settleAdmission(result) },
+        codeHostReply
       )
       void turn.catch((err) => {
         this.host.log().error(`replyToSession dispatch failed for session "${req.sessionId}": ${formatErr(err)}`)
@@ -949,12 +947,7 @@ export class CollabCoordinator {
       // queued when pause/drain, loop protection, or backpressure rejected it.
       const admission = await admitted
       if (!admission.accepted) {
-        await this.markChildParentReply(callerKey, req.sessionId, 'failed')
-        return {
-          delivered: false,
-          targetSession: local.key,
-          reason: admission.reason === 'queue_full' ? 'queue_full' : 'busy'
-        }
+        return failed(admission.reason === 'queue_full' ? 'queue_full' : 'busy', local.key)
       }
       await this.markChildParentReply(callerKey, req.sessionId, 'queued-for-parent')
       this.host
@@ -967,7 +960,7 @@ export class CollabCoordinator {
     // Only available from a live agent-call turn's CallMeta; a human-triggered follow-up whose
     // origin is on another daemon has no coords to route by (getSessionByAcpId missed) → not_found.
     const coords = inbound?.originCoords
-    if (!coords || !inbound) return { delivered: false, reason: 'not_found' }
+    if (!coords || !inbound) return failed('not_found')
     const targetSession = sessionKey(coords.platform, coords.channel, coords.thread ?? '', inbound.callFrom)
     const res = await this.routeAgentMsgCrossDaemon(
       {

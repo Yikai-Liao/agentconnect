@@ -472,6 +472,7 @@ import { CpCollabRoutes, isSyntheticA2aChannel } from './cp/cp-collab-routes.js'
 import { ClientTransport, systemClock, type Clock, type TimerHandle } from '@agentconnect.md/connection'
 import { z } from 'zod'
 import { isNoResponseBody } from './session/no-response.js'
+import { sessionReplyRoute } from './session/reply-route.js'
 import { WorkspaceConflictError } from './cp/workspace-reader.js'
 import { createWorkspaceScope } from './cp/workspace-scope.js'
 import { createWorkspaceFileLinkResolver, type WorkspaceFileLinkResolver } from './messages/workspace-file-links.js'
@@ -9155,12 +9156,7 @@ export class Daemon {
       return this.cpCollab.agent(msg.toAgentId) ? nak(RD_AGENTMSG_NOT_READY) : record(nak('not_found'))
     }
 
-    // TERMINAL-VERIFY against the local collaboration snapshot (§2.5 #4), now ORG-scoped
-    // rather than (org, channel)-scoped: the relay's asserted org must be the org this
-    // daemon's directory records for the target, and the directional call policy must admit
-    // caller→target. Channel is only the session coordinate here (A2A is postless, #854), so
-    // a caller and target that share no channel — or a target with no IM integration at all —
-    // is legitimate. Missing snapshot / unknown agent ⇒ fail closed, as before.
+    // Terminal-verify same-org ownership; ordinary calls also require directional visibility.
     const targetOrg = this.cpCollab.orgForAgent(msg.toAgentId)
     // Our directory copy may still be catching up with the grant: refuse retryably, uncached.
     if (targetOrg === undefined) {
@@ -9171,7 +9167,11 @@ export class Daemon {
       this.log.warn(`relay: rd/agentmsg/fwd terminal-verify failed (org mismatch) for ${msg.toAgentId} — fail closed`)
       return record(nak('not_allowed'))
     }
-    if (!this.cpCollab.admits(msg.trustedFromAgentId, msg.toAgentId)) {
+    // A parent return uses the origin capability; ordinary calls still need directional visibility.
+    if (
+      this.cpCollab.orgForAgent(msg.trustedFromAgentId) !== msg.orgId ||
+      (msg.lineageReplyTo === undefined && !this.cpCollab.admits(msg.trustedFromAgentId, msg.toAgentId))
+    ) {
       this.log.info(
         `relay: rd/agentmsg/fwd not_allowed — call policy excludes ${msg.trustedFromAgentId} → ${msg.toAgentId}`
       )
@@ -9198,29 +9198,13 @@ export class Daemon {
       ...(msg.parentPrivate === true ? { parentPrivate: true } : {})
     }
 
-    // §5.3 lineage REPLY: dispatch into the EXACT existing origin session instead of
-    // coordinate keying. The sender's daemon enforced origin-only authorization (the
-    // replier's turn originated from this session); terminal validation here is
-    // possession + ownership — the high-entropy acpSessionId is only handed out
-    // through wake lineage, and the AGENT-SCOPED lookup below IS the ownership check
-    // (ACP session ids are runtime/agent-local, so two agents may legitimately share
-    // one; a global lookup could surface the wrong agent's row). This branch runs
-    // BEFORE the wake-coordinate membership gate: a lineage reply never keys or
-    // creates a session from `coords`, so the aliasing threat that gate closes is
-    // absent — and membership would wrongly reject a replier that does not share the
-    // origin's channel (an explicitly supported org-scoped case). Org + directional
-    // policy above still apply. A missing session NAKs `not_found`, mirroring the
-    // local replyToSession contract — SessionTarget never creates a session.
+    // The source daemon checks origin authority; an agent-scoped lookup here prevents session aliasing.
     if (msg.lineageReplyTo !== undefined) {
       const origin = await this.store.getSessionByOutwardId(msg.lineageReplyTo, msg.toAgentId)
       if (!origin) return record(nak('not_found'))
-      // Reply transport from the SESSION's own scope (mirrors replyToSession's local branch).
-      const replyIntegrationId = this.integrationIdForSessionTransport(
-        origin.agentId,
-        origin.platform,
-        origin.transportScope
-      )
-      if (origin.transportScope && !replyIntegrationId) return record(nak('not_found'))
+      const route = sessionReplyRoute(origin, (...args) => this.integrationIdForSessionTransport(...args))
+      if (!route) return record(nak('not_found'))
+      const { integrationId: replyIntegrationId, codeHostReply } = route
       // §7: a lineage reply IS the cross-daemon parent-session reply, so it behaves exactly
       // like `replyToSession`'s local branch — no `headless` stamp. The injected report is
       // transcript-only (nothing here publishes it) and the resumed parent runs an ordinary
@@ -9256,15 +9240,24 @@ export class Daemon {
         // can answer in its own thread. A parent living on another daemon must not differ
         // from a local one, so neither branch stamps `headless` any more.
       }
+      let settleAdmission!: (result: { accepted: boolean; reason?: string }) => void
+      const admitted = new Promise<{ accepted: boolean; reason?: string }>((resolve) => {
+        settleAdmission = resolve
+      })
       void this.dispatch(
         msg.toAgentId,
         reply,
         replyIntegrationId,
         this.webchatTransport.webchatWakeContext(origin.platform, origin.channel),
-        callMeta
-      ).catch((err) =>
+        callMeta,
+        { requireDurable: true, onAdmission: (result) => settleAdmission(result) },
+        codeHostReply
+      ).catch((err) => {
         this.log.error(`relay lineage-reply dispatch failed for agent "${msg.toAgentId}": ${formatErr(err)}`)
-      )
+        settleAdmission({ accepted: false, reason: 'error' })
+      })
+      const admission = await admitted
+      if (!admission.accepted) return record(nak(admission.reason === 'queue_full' ? 'queue_full' : 'busy'))
       this.log.info(
         `relay: rd/agentmsg/fwd lineage reply ${msg.trustedFromAgentId} → ${msg.toAgentId} (${origin.key}) delivery=${msg.deliveryId}`
       )
@@ -10639,8 +10632,8 @@ export class Daemon {
       integrationIdForSessionTransport: (agentId, platform, scope) =>
         this.integrationIdForSessionTransport(agentId, platform, scope),
       servesAgent: (agentId) => this.servesAgent(agentId),
-      dispatch: (agentId, msg, integrationId, webchat, callMeta, opts) =>
-        this.dispatch(agentId, msg, integrationId, webchat, callMeta, opts),
+      dispatch: (agentId, msg, integrationId, webchat, callMeta, opts, codeHostReply) =>
+        this.dispatch(agentId, msg, integrationId, webchat, callMeta, opts, codeHostReply),
       webchatTransport: () => this.webchatTransport,
       externalOriginForSession: (agentId, sessionKey) => this.externalOriginForSession(agentId, sessionKey),
       // The integration the wake actually selected, not any same-platform one: an agent can
@@ -11010,6 +11003,7 @@ export class Daemon {
       integrationId: entry.integrationId ?? null,
       callMeta: entry.callMeta ? JSON.stringify(entry.callMeta) : null,
       hookContext: entry.hookContext ? JSON.stringify(entry.hookContext) : null,
+      codeHostReplyTarget: entry.githubReply ? JSON.stringify(entry.githubReply) : null,
       posterPublishState: entry.posterPublishState ?? null,
       isQueueCmd: entry.isQueueCmd ? 1 : null,
       // persistInbox runs only after a successful admission. New rows are born
@@ -11051,7 +11045,7 @@ export class Daemon {
     posterPublishState?: QueueEntry['posterPublishState'],
     required = false
   ): Promise<void> {
-    if (!entry.inboxId || !entry.hookContext) {
+    if (!entry.inboxId || (!entry.hookContext && !entry.githubReply)) {
       if (required) throw new Error('hook state has no durable inbox row')
       return
     }
@@ -11059,7 +11053,7 @@ export class Daemon {
     try {
       const updated = await this.store.updateInboxHookState(
         entry.inboxId,
-        JSON.stringify(entry.hookContext),
+        entry.hookContext ? JSON.stringify(entry.hookContext) : null,
         posterPublishState
       )
       if (!updated) throw new Error('durable inbox row is missing')
@@ -13159,6 +13153,14 @@ export class Daemon {
   }> {
     const { entry, key, plan } = run
     const { agentId, callMeta } = entry
+    // Only trusted hook ingress establishes an output target; console turns and children cannot replace it.
+    if (entry.msg.source === 'hook' && entry.msg.platform === 'hook') {
+      await this.store.setSessionCodeHostReplyTarget(
+        key,
+        agentId,
+        entry.githubReply ? JSON.stringify(entry.githubReply) : null
+      )
+    }
     // session/new|load may emit title/usage metadata before the local row exists.
     // Replay only after Pending owns the live sink so persisted and streamed state
     // converge in the same turn instead of requiring a browser refresh.
@@ -19691,10 +19693,14 @@ export class Daemon {
       let msg: NormalizedMessage
       let callMeta: CallMeta | undefined
       let hookContext: HookDispatchContext | undefined
+      let codeHostReply: CodeHostReplyTarget | undefined
       try {
         msg = JSON.parse(row.msg) as NormalizedMessage
         callMeta = row.callMeta ? (JSON.parse(row.callMeta) as CallMeta) : undefined
         hookContext = row.hookContext ? (JSON.parse(row.hookContext) as HookDispatchContext) : undefined
+        codeHostReply = row.codeHostReplyTarget
+          ? (JSON.parse(row.codeHostReplyTarget) as CodeHostReplyTarget)
+          : hookContext?.githubReply
       } catch (err) {
         this.log.warn(`durable inbox: skipping corrupt row ${row.id}: ${(err as Error).message}`)
         continue
@@ -19765,7 +19771,7 @@ export class Daemon {
       const posterPublishState =
         row.posterPublishState === 'in_flight' || row.posterPublishState === 'settled'
           ? row.posterPublishState
-          : hookContext?.githubReply
+          : codeHostReply
             ? 'not_started'
             : undefined
       // Re-admit through the same gate. The turn's own dispatch() promise is unobserved here
@@ -19795,9 +19801,9 @@ export class Daemon {
           replay: row.loopGuardCounted === 1,
           adoptExistingInbox: true,
           onAdmission: () => settleReplayAdmission(),
-          ...(hookContext ? { requireDurable: true } : {})
+          ...(hookContext || codeHostReply ? { requireDurable: true } : {})
         },
-        hookContext?.githubReply,
+        codeHostReply,
         hookContext,
         posterPublishState
       )

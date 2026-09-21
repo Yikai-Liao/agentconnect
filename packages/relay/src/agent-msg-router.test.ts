@@ -117,6 +117,36 @@ function fakeDaemons(
 }
 
 describe('relay rd/agentmsg routing + auth (agent-collaboration P2)', () => {
+  it('forwards an origin reply under one-way policy while refusing direct calls, forged callers and foreign organizations', async () => {
+    const snapshot = snap()
+    snapshot.agents[0]!.outboundPolicy = 'selected'
+    snapshot.agents[1]!.callPolicy = 'selected'
+    const router = new CollaborationRouter()
+    router.replace(snapshot)
+    const forwards: RdAgentMsgFwd[] = []
+    const route = createAgentMsgRouter({
+      router,
+      daemons: () => fakeDaemons({ deliveryId: 'reply', delivered: true }, forwards),
+      log: noopLog
+    })
+    expect(await route(D1, baseMsg())).toMatchObject({ delivered: false, reason: 'not_allowed' })
+    const reply = baseMsg({ deliveryId: 'reply', deliveryKind: 'session-reply', lineageReplyTo: 'parent-session' })
+    expect(await route(D1, reply)).toMatchObject({ delivered: true })
+    expect(forwards).toHaveLength(1)
+    expect(forwards[0]).toMatchObject({ trustedFromAgentId: A, orgId: ORG, lineageReplyTo: 'parent-session' })
+    expect(await route(D2, { ...reply, deliveryId: 'forged' })).toMatchObject({
+      delivered: false,
+      reason: 'not_allowed'
+    })
+    snapshot.agents[1]!.orgId = ORG2
+    router.replace(snapshot)
+    expect(await route(D1, { ...reply, deliveryId: 'foreign' })).toMatchObject({
+      delivered: false,
+      reason: 'not_found'
+    })
+    expect(forwards).toHaveLength(1)
+  })
+
   it('recognizes a managed Slack app only alongside the target channel placement', () => {
     const router = new CollaborationRouter()
     router.replace(snap())
