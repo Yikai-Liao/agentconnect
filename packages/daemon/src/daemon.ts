@@ -13,6 +13,7 @@ import {
   CODEHOST_NOTE_PROJECTION_V1_FEATURE,
   CODEHOST_REVIEW_V1_FEATURE,
   codeHostHookMetadataOf,
+  isCodeHostProvider,
   pickCodeHostHookMembers,
   GITLAB_COM_V1_FEATURE,
   GITLAB_INSTANCE_V1_FEATURE,
@@ -9177,8 +9178,15 @@ export class Daemon {
       )
       return record(nak('not_allowed'))
     }
-    // Build the trusted turn context + NormalizedMessage (source:'agent'), reusing the
-    // same shape as the same-daemon path. callFrom = the RELAY-minted trusted caller.
+    // Reject reply providers this daemon cannot execute before admitting their trusted coordinates.
+    if (
+      [msg.originCodeHostReplyTarget, msg.codeHostReplyTarget].some(
+        (target) => target && !isCodeHostProvider(target.provider)
+      )
+    ) {
+      return record(nak('unsupported'))
+    }
+    // The relay-minted caller and its origin snapshot become the durable turn context.
     const callMeta: CallMeta = {
       callFrom: msg.trustedFromAgentId,
       ...(msg.correlationId !== undefined ? { correlationId: msg.correlationId } : {}),
@@ -9187,6 +9195,7 @@ export class Daemon {
       // §5.3: preserve the remote caller's origin lineage so a child woken here can reply
       // back across the relay to a parent session that lives on the caller's daemon.
       ...(msg.originSessionId !== undefined ? { originSessionId: msg.originSessionId } : {}),
+      originCodeHostReplyTarget: msg.originCodeHostReplyTarget as CodeHostReplyTarget | null | undefined,
       ...(msg.originCoords !== undefined ? { originCoords: msg.originCoords } : {}),
       ...(msg.externalOrigin !== undefined ? { externalOrigin: msg.externalOrigin } : {}),
       // §5.4: the remote caller asked this child to report its outcome back. Same gate as the
@@ -9202,7 +9211,11 @@ export class Daemon {
     if (msg.lineageReplyTo !== undefined) {
       const origin = await this.store.getSessionByOutwardId(msg.lineageReplyTo, msg.toAgentId)
       if (!origin) return record(nak('not_found'))
-      const route = sessionReplyRoute(origin, (...args) => this.integrationIdForSessionTransport(...args))
+      const route = sessionReplyRoute(
+        origin,
+        (...args) => this.integrationIdForSessionTransport(...args),
+        msg.codeHostReplyTarget as CodeHostReplyTarget | null | undefined
+      )
       if (!route) return record(nak('not_found'))
       const { integrationId: replyIntegrationId, codeHostReply } = route
       // §7: a lineage reply IS the cross-daemon parent-session reply, so it behaves exactly
@@ -13153,12 +13166,12 @@ export class Daemon {
   }> {
     const { entry, key, plan } = run
     const { agentId, callMeta } = entry
-    // Only trusted hook ingress establishes an output target; console turns and children cannot replace it.
-    if (entry.msg.source === 'hook' && entry.msg.platform === 'hook') {
-      await this.store.setSessionCodeHostReplyTarget(
+    // Bind the child's first parent snapshot once; active calls keep their own targets in CallMeta.
+    if (callMeta?.originSessionId && callMeta.originCodeHostReplyTarget !== undefined) {
+      await this.store.bindSessionOriginReplyTarget(
         key,
-        agentId,
-        entry.githubReply ? JSON.stringify(entry.githubReply) : null
+        callMeta.originSessionId,
+        JSON.stringify(callMeta.originCodeHostReplyTarget)
       )
     }
     // session/new|load may emit title/usage metadata before the local row exists.

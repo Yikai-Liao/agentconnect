@@ -216,8 +216,6 @@ export interface SessionRecord {
   thread: string
   /** Identity boundary for transcript/session isolation: a physical chat account or a code-host repository. */
   transportScope?: string | null
-  /** Trusted code-host output coordinates, independent of a hook run's review authority. */
-  codeHostReplyTarget?: string | null
   /** What the RUNTIME knows this session by, used on the ACP hop alone (§1.1). Null until it exists. */
   acpSessionId: string | null
   /** The session's OUTWARD identity (§1.1), minted when the slot resolves — so it exists before
@@ -273,6 +271,8 @@ export interface SessionRecord {
   // it authorizes this session's SessionTarget replies back to the parent on EVERY turn, not just
   // the waking one — a human-triggered follow-up turn carries no per-turn CallMeta. NULL for roots.
   originSessionId?: string | null
+  /** The first parent link's output snapshot; JSON null records an explicitly private return route. */
+  originCodeHostReplyTarget?: string | null
   // Outcome of the LAST completed turn of this session: 'done' when the turn ended cleanly,
   // 'failed' when it ended in a problem phase (agent start failure, ACP/prompt rejection, loop
   // protection). NULL until the session has completed a turn. `state` still decides whether a
@@ -1176,7 +1176,7 @@ const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean }) => Promise<v
   async (db) => await db.exec(APPEND_RESERVATION_SCHEMA),
   // Parent replies retain output coordinates without replaying a completed hook run.
   async (db) => {
-    await db.exec('ALTER TABLE sessions ADD COLUMN codeHostReplyTarget TEXT')
+    await db.exec('ALTER TABLE sessions ADD COLUMN originCodeHostReplyTarget TEXT')
     await db.exec('ALTER TABLE inbox ADD COLUMN codeHostReplyTarget TEXT')
   }
 ]
@@ -1280,7 +1280,7 @@ export class LocalStore {
       ${MEMORY_CONTINUATION_SCHEMA}
       CREATE TABLE IF NOT EXISTS sessions (
         key TEXT PRIMARY KEY, agentId TEXT, platform TEXT, channel TEXT, thread TEXT,
-        transportScope TEXT, codeHostReplyTarget TEXT, acpSessionId TEXT, sessionId TEXT, state TEXT, lastDeliveredTs TEXT, updatedAt INTEGER,
+        transportScope TEXT, originCodeHostReplyTarget TEXT, acpSessionId TEXT, sessionId TEXT, state TEXT, lastDeliveredTs TEXT, updatedAt INTEGER,
         usage TEXT, muted INTEGER, triggeredBy TEXT, title TEXT, threadUrl TEXT, modelOverride TEXT,
         observedModel TEXT, observedModelSet INTEGER NOT NULL DEFAULT 0,
         effortOverride TEXT, permissionModeOverride TEXT, fastModeOverride INTEGER,
@@ -1918,10 +1918,12 @@ export class LocalStore {
     return (await this.db.prepare('SELECT * FROM sessions WHERE key = ?').get(key)) as SessionRecord | undefined
   }
 
-  async setSessionCodeHostReplyTarget(key: string, agentId: string, target: string | null): Promise<void> {
+  async bindSessionOriginReplyTarget(key: string, originSessionId: string, target: string): Promise<void> {
     await this.db
-      .prepare('UPDATE sessions SET codeHostReplyTarget = ? WHERE key = ? AND agentId = ?')
-      .run(target, key, agentId)
+      .prepare(
+        'UPDATE sessions SET originCodeHostReplyTarget = ? WHERE key = ? AND originSessionId = ? AND originCodeHostReplyTarget IS NULL'
+      )
+      .run(target, key, originSessionId)
   }
 
   /**

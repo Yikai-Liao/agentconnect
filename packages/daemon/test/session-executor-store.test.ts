@@ -134,7 +134,7 @@ describe('LocalStore session executor', () => {
     const old = new DatabaseSync(path)
     old.exec('ALTER TABLE sessions DROP COLUMN executorDaemonId')
     old.exec('ALTER TABLE sessions DROP COLUMN stayedHomeReason')
-    old.exec('ALTER TABLE sessions DROP COLUMN codeHostReplyTarget')
+    old.exec('ALTER TABLE sessions DROP COLUMN originCodeHostReplyTarget')
     old.exec('ALTER TABLE inbox DROP COLUMN codeHostReplyTarget')
     old.exec(`INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
       VALUES ('k1', 'bot-a', 'slack', 'C1', 'T1', 'acp-1', 'idle', 100)`)

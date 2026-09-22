@@ -42,6 +42,7 @@ import {
   isRetryableAgentMsgAck,
   RD_AGENTMSG_NOT_READY,
   RD_HEADLESS_AGENT_DELIVERY_V1,
+  RD_CODEHOST_REPLY_TARGET_V1,
   type RdAgentMsg,
   type RdAgentMsgAck,
   type RdAgentMsgReason
@@ -165,6 +166,14 @@ export function createAgentMsgRouter(deps: AgentMsgRouterDeps) {
     const conn = deps.daemons()?.get(target.daemonId)
     if (!conn) return nak(msg.deliveryId, 'offline')
 
+    // Losing either a reply target or explicit private origin would change the caller's output audience.
+    if (
+      (msg.originCodeHostReplyTarget !== undefined || msg.codeHostReplyTarget !== undefined) &&
+      !conn.supports(RD_CODEHOST_REPLY_TARGET_V1)
+    ) {
+      return nak(msg.deliveryId, 'unsupported')
+    }
+
     // (f0) send-message-routing-rework.md §8.4 — capability gate for `session-reply`. A
     // daemon that never advertised this predates the delivery kind entirely: it would key
     // the reply by coordinates instead of dispatching into the named parent session. The
@@ -203,6 +212,10 @@ export function createAgentMsgRouter(deps: AgentMsgRouterDeps) {
         // Origin lineage (session-concept §5.3) is the caller's own, forwarded opaquely —
         // the relay neither mints nor validates it; it only lets the woken child reply back.
         ...(msg.originSessionId !== undefined ? { originSessionId: msg.originSessionId } : {}),
+        ...(msg.originCodeHostReplyTarget !== undefined
+          ? { originCodeHostReplyTarget: msg.originCodeHostReplyTarget }
+          : {}),
+        ...(msg.codeHostReplyTarget !== undefined ? { codeHostReplyTarget: msg.codeHostReplyTarget } : {}),
         ...(msg.originCoords !== undefined ? { originCoords: msg.originCoords } : {}),
         ...(msg.externalOrigin !== undefined ? { externalOrigin: msg.externalOrigin } : {}),
         // §5.3 lineage reply target — opaque to the relay; the TARGET daemon terminally

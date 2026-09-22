@@ -115,6 +115,7 @@ export const canonicalColumns = [
   'organizationSuggestions',
   'orgId',
   'originSessionId',
+  'originCodeHostReplyTarget',
   'ownerId',
   'outputModeOverride',
   'parentId',

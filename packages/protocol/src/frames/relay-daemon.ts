@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { CodeHostReplyTarget } from '../code-host.js'
 import { ExternalSessionAudience } from './telemetry.js'
 import {
   NormalizedPlatformMessageSchema,
@@ -73,6 +74,9 @@ export const RELAY_DAEMON_WS_PATH = '/rd/ws'
  */
 export const RD_HEADLESS_AGENT_DELIVERY_V1 = 'headless-agent-delivery-v1'
 
+/** Both relay and daemon preserve immutable code-host reply targets across delegation and return. */
+export const RD_CODEHOST_REPLY_TARGET_V1 = 'codehost-reply-target-v1'
+
 /**
  * `agent-implicit-routing-v1`: this daemon understands {@link RdMsgIm.trustedRouteVia}
  * and applies its `!stop` thread mute to an implicitly-selected per-target delivery.
@@ -146,7 +150,8 @@ export type RdHello = z.infer<typeof RdHello>
 // as a misroute (close + backoff), never silently continue on the wrong
 // instance. Rejection is an `error` REP + close, not a reply.
 export const RdHelloOk = z.object({
-  relayId: z.string().uuid()
+  relayId: z.string().uuid(),
+  capabilities: z.array(z.string().min(1)).max(32).optional()
 })
 export type RdHelloOk = z.infer<typeof RdHelloOk>
 
@@ -680,6 +685,8 @@ export const RdAgentMsg = z.object({
   // when the origin lives on another daemon (no sessionId→daemon registry on the relay).
   // Both optional — a root / self-introduce wake has no origin, and old daemons omit them.
   originSessionId: z.string().min(1).optional(),
+  // A null snapshot preserves a Console-only origin even when a later hook has a public target.
+  originCodeHostReplyTarget: CodeHostReplyTarget.nullable().optional(),
   originCoords: z
     .object({
       platform: Platform, // S1a open reader (route.ts policy)
@@ -702,6 +709,8 @@ export const RdAgentMsg = z.object({
   // reply (a channel-free origin's coordinate is not its key). Absent = ordinary
   // coordinate-keyed wake.
   lineageReplyTo: z.string().min(1).optional(),
+  // Echo the delegating turn's snapshot; never resolve the parent session's latest destination.
+  codeHostReplyTarget: CodeHostReplyTarget.nullable().optional(),
   // session-concept §5.4: the caller asked the woken session to report its outcome back into
   // `originSessionId` (`sendMessage`'s `toAgent.needsReply`). The target daemon turns this into a
   // standing directive on the child; it is never part of the delivered `text`. Meaningless without
@@ -783,6 +792,8 @@ export const RdAgentMsgFwd = z.object({
   // child may reply into. The relay forwards these opaquely — they are the caller's own
   // lineage, not a claim the relay mints or validates.
   originSessionId: z.string().min(1).optional(),
+  // A null snapshot preserves a Console-only origin even when a later hook has a public target.
+  originCodeHostReplyTarget: CodeHostReplyTarget.nullable().optional(),
   originCoords: z
     .object({
       platform: Platform, // S1a open reader (route.ts policy)
@@ -804,6 +815,8 @@ export const RdAgentMsgFwd = z.object({
   // origin's channel. Authenticated org routing and the origin session capability
   // (possession of the id + ownership by `toAgentId`) still gate delivery.
   lineageReplyTo: z.string().min(1).optional(),
+  // Echo the delegating turn's snapshot; never resolve the parent session's latest destination.
+  codeHostReplyTarget: CodeHostReplyTarget.nullable().optional(),
   // Forwarded verbatim from RdAgentMsg (session-concept §5.4): the caller's request that the woken
   // session report its outcome back into `originSessionId`. Opaque to the relay — it is the
   // caller's own instruction about its own lineage, not a claim the relay mints or validates.

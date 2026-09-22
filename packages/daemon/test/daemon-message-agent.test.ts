@@ -809,34 +809,63 @@ describe('messageAgent: cross-daemon routing (P2, source side)', () => {
     await daemon.stop()
   })
 
-  it('forwards needsReply on the wire when the caller has an origin session', async () => {
-    const root = scaffold([{ id: 'bot-a' }]) // bot-b is remote
-    const { daemon, call } = await bootWithDispatchSpy(root)
-    const sent: any[] = []
-    ;(daemon as any).relays = {
-      stop: vi.fn(async () => {}),
-      sendAgentMsg: vi.fn(async (payload: any) => {
-        sent.push(payload)
-        return { deliveryId: payload.deliveryId, delivered: true }
+  it.each([true, false])(
+    'forwards the code-host origin snapshot for a remote child (public turn: %s)',
+    async (publicTurn) => {
+      const root = scaffold([{ id: 'bot-a' }]) // bot-b is remote
+      const { daemon, call } = await bootWithDispatchSpy(root)
+      const sent: any[] = []
+      ;(daemon as any).relays = {
+        stop: vi.fn(async () => {}),
+        sendAgentMsg: vi.fn(async (payload: any) => {
+          sent.push(payload)
+          return { deliveryId: payload.deliveryId, delivered: true }
+        })
+      }
+      const d = daemon as any
+      const callerKey = sessionKey('hook', 'acme/project', '42', 'bot-a', 'github:123')
+      const target = {
+        provider: 'github',
+        hookId: 'hook-1',
+        repo: 'acme/project',
+        number: 42,
+        reviewThreadRootCommentId: '101'
+      }
+      if (publicTurn) d.activeGateEntries.set(callerKey, { githubReply: target })
+      await d.store.upsertSession({
+        key: callerKey,
+        agentId: 'bot-a',
+        platform: 'hook',
+        channel: 'acme/project',
+        thread: '42',
+        transportScope: 'github:123',
+        acpSessionId: 'acp-parent-1',
+        sessionId: 'sid-parent-1',
+        state: 'prompting',
+        lastDeliveredTs: null,
+        updatedAt: Date.now()
       })
-    }
-    await (daemon as any).store.upsertSession({
-      key: sessionKey('slack', 'C1', '100.1', 'bot-a'),
-      agentId: 'bot-a',
-      platform: 'slack',
-      channel: 'C1',
-      thread: '100.1',
-      acpSessionId: 'acp-parent-1',
-      sessionId: 'sid-parent-1',
-      state: 'prompting',
-      lastDeliveredTs: null,
-      updatedAt: Date.now()
-    })
 
-    await call(baseReq({ toAgentId: 'bot-b', needsReply: true }))
-    expect(sent[0]).toMatchObject({ originSessionId: 'sid-parent-1', needsReply: true })
-    await daemon.stop()
-  })
+      await call(
+        baseReq({
+          platform: 'hook',
+          callerChannel: 'acme/project',
+          callerThread: '42',
+          callerTransportScope: 'github:123',
+          channel: 'a2a:bot-a',
+          toAgentId: 'bot-b',
+          needsReply: true
+        })
+      )
+      expect(sent[0]).toMatchObject({
+        originSessionId: 'sid-parent-1',
+        needsReply: true,
+        originCodeHostReplyTarget: publicTurn ? target : null
+      })
+      d.activeGateEntries.delete(callerKey)
+      await daemon.stop()
+    }
+  )
 
   it('omits needsReply on the wire with no origin to report to, and for a plain wake', async () => {
     const root = scaffold([{ id: 'bot-a' }])
@@ -1115,13 +1144,16 @@ describe('handleRelayAgentMsg: cross-daemon target side (P2)', () => {
       lastDeliveredTs: null,
       updatedAt: 1
     })
-    await d.store.setSessionCodeHostReplyTarget(key, 'bot-b', JSON.stringify(target))
     try {
       expect(await d.handleRelayAgentMsg(fwd({ deliveryId: 'direct' }))).toMatchObject({
         delivered: false,
         reason: 'not_allowed'
       })
-      expect(await d.handleRelayAgentMsg(fwd({ deliveryId: 'return', lineageReplyTo: 'sid-parent' }))).toMatchObject({
+      expect(
+        await d.handleRelayAgentMsg(
+          fwd({ deliveryId: 'return', lineageReplyTo: 'sid-parent', codeHostReplyTarget: target })
+        )
+      ).toMatchObject({
         delivered: true,
         childSessionId: key
       })
@@ -1130,6 +1162,10 @@ describe('handleRelayAgentMsg: cross-daemon target side (P2)', () => {
         codeHostReply: target,
         msg: { source: 'agent', parentReport: true, transportScope: 'github:123' }
       })
+      expect(await d.handleRelayAgentMsg(fwd({ deliveryId: 'legacy', lineageReplyTo: 'sid-parent' }))).toMatchObject({
+        delivered: true
+      })
+      expect(calls[1]!.codeHostReply).toBeUndefined()
       expect(
         await d.handleRelayAgentMsg(
           fwd({ deliveryId: 'forged', lineageReplyTo: 'sid-parent', trustedFromAgentId: 'unknown' })
@@ -1393,10 +1429,14 @@ describe('handleRelayAgentMsg: cross-daemon target side (P2)', () => {
     const { daemon, calls } = await bootWithDispatchSpy(root)
     withSnapshot(daemon)
     const ack = await (daemon as any).handleRelayAgentMsg(
-      fwd({ originSessionId: 'sid-remote-parent', needsReply: true })
+      fwd({ originSessionId: 'sid-remote-parent', needsReply: true, originCodeHostReplyTarget: null })
     )
     expect(ack.delivered).toBe(true)
-    expect(calls[0]!.callMeta).toMatchObject({ originSessionId: 'sid-remote-parent', needsReply: true })
+    expect(calls[0]!.callMeta).toMatchObject({
+      originSessionId: 'sid-remote-parent',
+      needsReply: true,
+      originCodeHostReplyTarget: null
+    })
     // The obligation is metadata — it never enters the delivered text.
     expect(calls[0]!.msg.text).not.toMatch(/needsReply|report back/i)
     await daemon.stop()
@@ -2115,11 +2155,19 @@ describe('replyToSession: SessionTarget delivery + origin-only authorization', (
       })
     }
     const callerKey = sessionKey('slack', 'C2', '200.1', 'bot-b')
+    const target = {
+      provider: 'github',
+      hookId: 'hook-1',
+      repo: 'acme/project',
+      number: 42,
+      reviewThreadRootCommentId: '101'
+    }
     armTurn(daemon, callerKey, {
       callFrom: 'bot-a',
       hopCount: 1,
       deliveryId: 'd1',
       originSessionId: 'sid-remote-dream',
+      originCodeHostReplyTarget: target,
       originCoords: { platform: 'dream', channel: 'memory', thread: 'dream-1' }
     })
     const res = await (daemon as any).collab.replyToSession(replyReq({ sessionId: 'sid-remote-dream' }))
@@ -2129,23 +2177,25 @@ describe('replyToSession: SessionTarget delivery + origin-only authorization', (
     expect(sent[0]).toMatchObject({
       toAgentId: 'bot-a',
       coords: { platform: 'dream', channel: 'memory', thread: 'dream-1' },
-      lineageReplyTo: 'sid-remote-dream'
+      lineageReplyTo: 'sid-remote-dream',
+      codeHostReplyTarget: target
     })
     await daemon.stop()
   })
 
-  it('authorizes via the caller session’s PERSISTED origin on a human turn with no active CallMeta', async () => {
+  it('uses the durable origin snapshot only when the current turn has no parent', async () => {
     // The regression that "replies once then stops": a spawned session's later, human-triggered
     // turns carry no per-turn CallMeta, so auth must fall back to the DURABLE origin on the row.
     const root = scaffold([{ id: 'bot-a' }, { id: 'bot-b' }])
     const { daemon, calls } = await bootWithDispatchSpy(root)
     // Origin (parent) session, owner bot-a.
     await (daemon as any).store.upsertSession({
-      key: sessionKey('slack', 'C1', '100.1', 'bot-a'),
+      key: sessionKey('hook', 'acme/project', '42', 'bot-a', 'github:123'),
       agentId: 'bot-a',
-      platform: 'slack',
-      channel: 'C1',
-      thread: '100.1',
+      platform: 'hook',
+      channel: 'acme/project',
+      thread: '42',
+      transportScope: 'github:123',
       acpSessionId: 'acp-parent-1',
       sessionId: 'sid-parent-1',
       state: 'idle',
@@ -2166,13 +2216,35 @@ describe('replyToSession: SessionTarget delivery + origin-only authorization', (
       updatedAt: Date.now(),
       originSessionId: 'sid-parent-1'
     })
-    // NO armTurn: activeTurnCallMeta is empty for the caller (a human-triggered follow-up turn).
+    const childKey = sessionKey('slack', 'C2', '200.1', 'bot-b')
+    const target = {
+      provider: 'github',
+      hookId: 'hook-1',
+      repo: 'acme/project',
+      number: 42,
+      reviewThreadRootCommentId: '101'
+    }
+    await (daemon as any).store.bindSessionOriginReplyTarget(childKey, 'sid-parent-1', JSON.stringify(target))
+    // A human follow-up retains the first parent's reply thread.
     const res = await (daemon as any).collab.replyToSession(replyReq())
     expect(res.delivered).toBe(true)
-    expect(res.targetSession).toBe('slack:C1:100.1:bot-a')
+    expect(res.targetSession).toBe(sessionKey('hook', 'acme/project', '42', 'bot-a', 'github:123'))
     expect(calls).toHaveLength(1)
     // No inbound depth on a human turn ⇒ the reply chain starts at hop 1; callFrom = the replier.
     expect(calls[0]!.callMeta).toMatchObject({ callFrom: 'bot-b', hopCount: 1 })
+    expect(calls[0]!.codeHostReply).toEqual(target)
+    // A new Console or legacy call cannot reuse the older public snapshot.
+    for (const originCodeHostReplyTarget of [null, undefined]) {
+      armTurn(daemon, childKey, {
+        callFrom: 'bot-a',
+        hopCount: 0,
+        deliveryId: 'new-call',
+        originSessionId: 'sid-parent-1',
+        originCodeHostReplyTarget
+      })
+      expect(await (daemon as any).collab.replyToSession(replyReq())).toMatchObject({ delivered: true })
+      expect(calls.at(-1)!.codeHostReply).toBeUndefined()
+    }
     await daemon.stop()
   })
 

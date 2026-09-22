@@ -398,16 +398,6 @@ describe('webchat session-targeted continuation — hook origin', () => {
       externalResourceKind: 'repository',
       externalResourceKey: '42'
     })
-    await (daemon as any).store.setSessionCodeHostReplyTarget(
-      HOOK_KEY,
-      AGENT,
-      JSON.stringify({
-        provider: 'github',
-        hookId: 'hook-1',
-        repo: 'acme/project',
-        number: 1552
-      })
-    )
     const makeReply = vi.spyOn((daemon as any).githubReviews, 'makeCodeHostReply')
     const events: RdChatEvent[] = []
 

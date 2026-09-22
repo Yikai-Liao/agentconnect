@@ -51,7 +51,7 @@ const dropBirthVerdict = (db: DatabaseSync): void => {
 
 /** A pre-v23 store has no durable code-host output target. */
 const dropCodeHostReplyTarget = (db: DatabaseSync): void => {
-  db.exec('ALTER TABLE sessions DROP COLUMN codeHostReplyTarget')
+  db.exec('ALTER TABLE sessions DROP COLUMN originCodeHostReplyTarget')
   db.exec('ALTER TABLE inbox DROP COLUMN codeHostReplyTarget')
 }
 
@@ -87,7 +87,7 @@ const dropTranscriptOrg = (db: DatabaseSync): void => {
   `)
 }
 
-it('keeps a parent output target agent-owned and carries a separate publication fence in its inbox', async () => {
+it('binds the first parent reply target once and carries a separate publication fence in the report inbox', async () => {
   const s = await store()
   const parent = {
     key: 'parent',
@@ -98,15 +98,21 @@ it('keeps a parent output target agent-owned and carries a separate publication 
     acpSessionId: 'acp-parent',
     state: 'idle' as const,
     lastDeliveredTs: null,
-    updatedAt: 1
+    updatedAt: 1,
+    originSessionId: 'origin'
   }
   await s.upsertSession(parent)
   const target = JSON.stringify({ provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 })
-  await s.setSessionCodeHostReplyTarget('parent', 'bot-b', target)
-  expect((await s.getSession('parent'))?.codeHostReplyTarget).toBeNull()
-  await s.setSessionCodeHostReplyTarget('parent', 'bot-a', target)
+  await s.bindSessionOriginReplyTarget('parent', 'other-origin', target)
+  expect((await s.getSession('parent'))?.originCodeHostReplyTarget).toBeNull()
+  await s.bindSessionOriginReplyTarget('parent', 'origin', target)
+  await s.bindSessionOriginReplyTarget('parent', 'origin', 'null')
   await s.upsertSession({ ...parent, updatedAt: 2 })
-  expect((await s.getSession('parent'))?.codeHostReplyTarget).toBe(target)
+  expect((await s.getSession('parent'))?.originCodeHostReplyTarget).toBe(target)
+  await s.upsertSession({ ...parent, key: 'private-child' })
+  await s.bindSessionOriginReplyTarget('private-child', 'origin', 'null')
+  await s.bindSessionOriginReplyTarget('private-child', 'origin', target)
+  expect((await s.getSession('private-child'))?.originCodeHostReplyTarget).toBe('null')
   await s.appendInbox({
     id: 'report',
     sessionKey: 'parent',
@@ -163,6 +169,7 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
       thread: '42',
       transportScope: 'github:123',
       acpSessionId: 'acp-parent',
+      originSessionId: 'origin',
       state: 'idle',
       lastDeliveredTs: null,
       updatedAt: 1
@@ -174,13 +181,13 @@ describe.skipIf(pg)('LocalStore schema versioning', () => {
     legacy.close()
     const upgraded = await LocalStore.open(path)
     const parent = (await upgraded.getSession('parent'))!
-    expect(parent.codeHostReplyTarget).toBeNull()
+    expect(parent.originCodeHostReplyTarget).toBeNull()
     const target = JSON.stringify({ provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 })
-    await upgraded.setSessionCodeHostReplyTarget('parent', 'bot-a', target)
+    await upgraded.bindSessionOriginReplyTarget('parent', 'origin', target)
     await upgraded.upsertSession({ ...parent, updatedAt: 2 })
     await upgraded.close()
     const restarted = await LocalStore.open(path)
-    expect((await restarted.getSession('parent'))?.codeHostReplyTarget).toBe(target)
+    expect((await restarted.getSession('parent'))?.originCodeHostReplyTarget).toBe(target)
     await restarted.close()
   })
 

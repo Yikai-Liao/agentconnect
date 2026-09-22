@@ -190,6 +190,8 @@ export interface CallMeta {
    *  self-introduce fan-out — those have no parent, so the child gets no `Parent session` line
    *  and cannot address a SessionTarget. */
   originSessionId?: string
+  /** Immutable output of the delegating turn; null means it had no public reply. */
+  originCodeHostReplyTarget?: CodeHostReplyTarget | null
   /** session-concept §5.3: the origin session's landing coords. Used to route a SessionTarget
    *  reply back when the origin session lives on ANOTHER daemon (the relay has no
    *  sessionId→daemon registry, so a cross-daemon reply routes by these coords + `callFrom`).

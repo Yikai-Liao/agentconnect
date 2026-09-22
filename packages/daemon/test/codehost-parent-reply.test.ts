@@ -10,20 +10,20 @@ import { WAIT } from './wait-support.js'
 const PARENT = 'parent'
 const CHILD = 'child'
 
-function hook(provider: 'github' | 'gitlab' | 'gitea'): RdMsgHook {
+function hook(provider: 'github' | 'gitlab' | 'gitea', reviewRoot?: string): RdMsgHook {
   return {
     source: 'hook',
     agentId: PARENT,
     hookId: 'hook-1',
-    deliveryKey: 'delivery-1',
-    msgId: 'hook-1:delivery-1',
-    sessionKey: `${provider}:123:issue:42`,
+    deliveryKey: reviewRoot ?? 'delivery-1',
+    msgId: `hook-1:${reviewRoot ?? 'delivery-1'}`,
+    sessionKey: provider === 'github' ? 'acme/project#42' : `${provider}:123:issue:42`,
     firedAt: new Date().toISOString(),
-    event: 'issues:opened',
+    event: reviewRoot ? 'pull_request_review_comment:created' : 'issues:opened',
     context: {
       source: provider,
-      event: 'issues',
-      action: 'opened',
+      event: reviewRoot ? 'pull_request_review_comment' : 'issues',
+      action: reviewRoot ? 'created' : 'opened',
       repo: 'acme/project',
       number: 42,
       truncated: false
@@ -34,7 +34,10 @@ function hook(provider: 'github' | 'gitlab' | 'gitea'): RdMsgHook {
             repoId: '123',
             repoFullName: 'acme/project',
             sourceInstallationId: '456',
-            subjectKind: 'issue' as const
+            subjectKind: reviewRoot ? ('pull_request' as const) : ('issue' as const),
+            ...(reviewRoot
+              ? { pullNumber: 42, reviewCommentId: reviewRoot, reviewThreadRootCommentId: reviewRoot }
+              : {})
           }
         }
       : {}),
@@ -98,8 +101,6 @@ describe('code-host parent replies', () => {
       try {
         await restarted.start()
         await vi.waitFor(() => expect(cp.emitHookReport).toHaveBeenCalledTimes(1), WAIT)
-        const parent = await (restarted as any).store.getSession(key)
-        expect(JSON.parse(parent.codeHostReplyTarget)).toMatchObject({ ...target, host: `https://${provider}.com` })
         expect(mint).not.toHaveBeenCalled()
         expect(fetchSpy).not.toHaveBeenCalled()
         expect(cp.emitHookReport).toHaveBeenCalledWith(
@@ -121,6 +122,91 @@ describe('code-host parent replies', () => {
 
   it('infers a child report into the same code-host output route', async () => {
     await roundTrip('github', false)
+  })
+
+  it.each([true, false])('keeps an inline report on thread A after thread B runs (explicit: %s)', async (explicit) => {
+    await roundTrip('github', explicit, true)
+  })
+
+  it.each(['public', 'console', 'legacy'] as const)('replays a child with its %s origin snapshot', async (source) => {
+    const root = scaffold([PARENT, CHILD])
+    const seed = new Daemon({
+      root,
+      hostFactory: scriptedHosts({ [PARENT]: () => 'AC_NO_RESPONSE', [CHILD]: () => 'unused' }).factory
+    })
+    await seed.start()
+    const seedCp = {
+      ...fakeCpClient(),
+      emitEventSession: vi.fn(),
+      emitHookReport: vi.fn(async () => 'acknowledged' as const)
+    }
+    ;(seed as any).cpClient = seedCp
+    const target = {
+      provider: 'github',
+      hookId: 'hook-1',
+      repo: 'acme/project',
+      number: 42,
+      reviewThreadRootCommentId: '101'
+    }
+    const snapshot = source === 'public' ? target : source === 'console' ? null : undefined
+    try {
+      ;(seed as any).handleRelayMsg(hook('github', '202'), () => {})
+      await vi.waitFor(() => expect(seedCp.emitHookReport).toHaveBeenCalledTimes(1), WAIT)
+      const [parent] = await (seed as any).store.listSessions(PARENT)
+      await (seed as any).store.appendInbox({
+        id: 'delegated-work',
+        sessionKey: sessionKey('dream', 'a2a:parent', 'work', CHILD),
+        agentId: CHILD,
+        enqueuedAt: '1',
+        loopGuardCounted: 1,
+        callMeta: JSON.stringify({
+          callFrom: PARENT,
+          hopCount: 0,
+          deliveryId: 'delegated-work',
+          originSessionId: parent.sessionId,
+          originCodeHostReplyTarget: snapshot,
+          needsReply: true,
+          externalOrigin: await (seed as any).externalOriginForSession(PARENT, parent.key)
+        }),
+        msg: JSON.stringify({
+          msgId: 'delegated-work',
+          source: 'agent',
+          platform: 'dream',
+          channel: 'a2a:parent',
+          thread: 'work',
+          sender: { id: PARENT, isBot: true },
+          text: 'Investigate.',
+          mentionedBots: [],
+          isDm: false
+        })
+      })
+    } finally {
+      await seed.stop()
+    }
+    const runtime = scriptedHosts({
+      [CHILD]: () => 'Private child findings.',
+      [PARENT]: () => 'Recovered parent answer.'
+    })
+    const restarted = new Daemon({ root, hostFactory: runtime.factory })
+    const publish = vi.fn(async () => {})
+    const makeReply = vi.fn(() => ({ poster: { publish }, collector: new GithubReplyCollector() }))
+    ;(restarted as any).cpClient = { ...fakeCpClient(), emitEventSession: vi.fn() }
+    ;(restarted as any).githubReviews.makeCodeHostReply = makeReply
+    try {
+      await restarted.start()
+      await vi.waitFor(() => expect(runtime.prompts.get(PARENT)).toHaveLength(1), WAIT)
+      await settle()
+      if (source === 'public') {
+        expect(makeReply).toHaveBeenCalledWith(PARENT, target, expect.any(String))
+        expect(publish).toHaveBeenCalledExactlyOnceWith('Recovered parent answer.')
+      } else {
+        expect(makeReply).not.toHaveBeenCalled()
+      }
+      const [child] = await (restarted as any).store.listSessions(CHILD)
+      expect(child.originCodeHostReplyTarget).toBe(snapshot === undefined ? null : JSON.stringify(snapshot))
+    } finally {
+      await restarted.stop()
+    }
   })
 
   it.each(['not_started', 'in_flight', 'settled'] as const)(
@@ -180,7 +266,7 @@ describe('code-host parent replies', () => {
   )
 })
 
-async function roundTrip(provider: 'github' | 'gitlab' | 'gitea', explicit: boolean) {
+async function roundTrip(provider: 'github' | 'gitlab' | 'gitea', explicit: boolean, interleave = false) {
   let releaseChild!: () => void
   const childCanFinish = new Promise<void>((resolve) => {
     releaseChild = resolve
@@ -209,6 +295,8 @@ async function roundTrip(provider: 'github' | 'gitlab' | 'gitea', explicit: bool
             toAgent: { agentId: CHILD, needsReply: true },
             message: 'Investigate and report back.'
           })
+          answer = 'AC_NO_RESPONSE'
+        } else if (interleave && parentInputs.length === 2) {
           answer = 'AC_NO_RESPONSE'
         } else {
           const d = daemon as any
@@ -273,22 +361,34 @@ async function roundTrip(provider: 'github' | 'gitlab' | 'gitea', explicit: bool
     }
   })
   try {
-    d.handleRelayMsg(hook(provider), () => {})
+    d.handleRelayMsg(hook(provider, interleave ? '101' : undefined), () => {})
     await vi.waitFor(() => expect(cp.emitHookReport).toHaveBeenCalledTimes(1), WAIT)
     expect(delegateResult).toMatchObject({ ok: true })
-    const [listedParent] = await d.store.listSessions(PARENT)
-    const parent = await d.store.getSession(listedParent.key)
-    expect(JSON.parse(parent.codeHostReplyTarget)).toMatchObject({ provider, hookId: 'hook-1', number: 42 })
+    await vi.waitFor(async () => {
+      const [child] = await d.store.listSessions(CHILD)
+      expect(JSON.parse(child?.originCodeHostReplyTarget ?? 'null')).toMatchObject({
+        provider,
+        hookId: 'hook-1',
+        number: 42
+      })
+    }, WAIT)
+    if (interleave) {
+      d.handleRelayMsg(hook(provider, '202'), () => {})
+      await vi.waitFor(() => expect(cp.emitHookReport).toHaveBeenCalledTimes(2), WAIT)
+      expect(await d.store.listSessions(PARENT)).toHaveLength(1)
+    }
     releaseChild()
     const replies = () => requests.filter((r) => typeof r.body.body === 'string')
     await vi.waitFor(() => expect(replies()).toHaveLength(1), WAIT)
     await settle()
     if (explicit) expect(childResult).toMatchObject({ ok: true })
-    expect(parentInputs).toHaveLength(2)
-    expect(parentInputs[1]).toContain('Private child findings.')
-    expect(parentInputs[1]?.includes('[inferred reply]')).toBe(!explicit)
+    expect(parentInputs).toHaveLength(interleave ? 3 : 2)
+    expect(parentInputs.at(-1)).toContain('Private child findings.')
+    expect(parentInputs.at(-1)?.includes('[inferred reply]')).toBe(!explicit)
     const endpoints = {
-      github: 'https://api.github.com/repos/acme/project/issues/42/comments',
+      github: interleave
+        ? 'https://api.github.com/repos/acme/project/pulls/42/comments/101/replies'
+        : 'https://api.github.com/repos/acme/project/issues/42/comments',
       gitlab: 'https://gitlab.com/api/v4/projects/123/issues/42/notes',
       gitea: 'https://gitea.com/api/v1/repos/acme/project/issues/42/comments'
     }
@@ -297,7 +397,7 @@ async function roundTrip(provider: 'github' | 'gitlab' | 'gitea', explicit: bool
     ])
     expect(JSON.stringify(requests)).not.toContain('Private child findings.')
     // A report resumes an ordinary turn, not the completed hook or its formal-review authority.
-    expect(cp.emitHookReport).toHaveBeenCalledTimes(1)
+    expect(cp.emitHookReport).toHaveBeenCalledTimes(interleave ? 2 : 1)
   } finally {
     releaseChild()
     await daemon.stop()

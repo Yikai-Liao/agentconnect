@@ -30,7 +30,7 @@ import {
 } from '../store/local-store.js'
 import { monotonicTs } from '../store/monotonic-ts.js'
 import { isNoResponseBody } from '../session/no-response.js'
-import { sessionReplyRoute } from '../session/reply-route.js'
+import { codeHostReplySnapshot, sessionReplyRoute } from '../session/reply-route.js'
 import type { CodeHostReplyTarget } from '../codehost/reply-target.js'
 import { isPlatformMemberId } from '../platforms/member-id.js'
 import { threadKeyForPost } from '../platforms/thread-keys.js'
@@ -421,6 +421,10 @@ export class CollabCoordinator {
     // only inside its own runtime, and this one travels to another agent, another daemon and
     // the CP. originCoords are its landing coords for cross-daemon reply routing.
     const callerSession = await this.host.store().getSession(callerKey)
+    const originCodeHostReplyTarget = codeHostReplySnapshot(
+      callerSession,
+      this.host.activeGateEntries().get(callerKey)?.githubReply
+    )
     const originSessionId = callerSession
       ? await this.host.store().ensureOutwardSessionId(callerKey, req.callerAgentId, this.host.clock().now())
       : undefined
@@ -517,6 +521,7 @@ export class CollabCoordinator {
           correlationId,
           ...(originSessionId !== undefined ? { originSessionId } : {}),
           originSessionKey: callerKey,
+          originCodeHostReplyTarget,
           originCoords,
           ...(externalOrigin ? { externalOrigin } : {})
         }
@@ -560,6 +565,7 @@ export class CollabCoordinator {
       deliveryId,
       // §5.3: hand the child its origin so it can reply back with `sendMessage({sessionId})`.
       ...(originSessionId !== undefined ? { originSessionId } : {}),
+      originCodeHostReplyTarget,
       originCoords,
       ...(externalOrigin ? { externalOrigin } : {}),
       // §5.3: `toAgent.needsReply` — tell the child to report its outcome back to that origin.
@@ -819,6 +825,15 @@ export class CollabCoordinator {
     if (!authorizedOrigin || req.sessionId !== authorizedOrigin) {
       return { delivered: false, reason: 'not_authorized' }
     }
+    const replyTarget = inbound?.originSessionId
+      ? inbound.originCodeHostReplyTarget
+      : callerRec?.originCodeHostReplyTarget
+        ? (JSON.parse(callerRec.originCodeHostReplyTarget) as CodeHostReplyTarget | null)
+        : undefined
+    const originCodeHostReplyTarget = codeHostReplySnapshot(
+      callerRec,
+      this.host.activeGateEntries().get(callerKey)?.githubReply
+    )
     const failed = async (
       reason: NonNullable<ReplyToSessionResult['reason']>,
       targetSession?: string
@@ -856,6 +871,7 @@ export class CollabCoordinator {
       hopCount: sourceHopCount + 1,
       deliveryId,
       ...(replierSessionId !== undefined ? { originSessionId: replierSessionId } : {}),
+      originCodeHostReplyTarget,
       originCoords: replyOriginCoords,
       ...(externalOrigin ? { externalOrigin } : {}),
       // §5.1: seal the child's capture gate when the waking session is private.
@@ -874,7 +890,11 @@ export class CollabCoordinator {
       const originOwner = local.agentId
       const originPlatform = local.platform
       // Local and remote replies resolve the parent's own sink while preserving its identity scope.
-      const route = sessionReplyRoute(local, (...args) => this.host.integrationIdForSessionTransport(...args))
+      const route = sessionReplyRoute(
+        local,
+        (...args) => this.host.integrationIdForSessionTransport(...args),
+        replyTarget
+      )
       if (!route) return failed('not_found', local.key)
       const { integrationId, codeHostReply } = route
       const resolved = this.host.resolveCpAgent(originOwner, originPlatform)
@@ -984,6 +1004,8 @@ export class CollabCoordinator {
         ...(correlationId !== undefined ? { correlationId } : {}),
         ...(replierSessionId !== undefined ? { originSessionId: replierSessionId } : {}),
         originSessionKey: callerKey,
+        originCodeHostReplyTarget,
+        codeHostReplyTarget: replyTarget,
         originCoords: replyOriginCoords,
         ...(externalOrigin ? { externalOrigin } : {}),
         // §5.3: this is a REPLY into the validated origin session, not a wake — the
@@ -1418,6 +1440,10 @@ export class CollabCoordinator {
       // would claim an audience this content was never posted to (§3.3).
       platformOrigin: true,
       ...(originSessionId ? { originSessionId } : {}),
+      originCodeHostReplyTarget: codeHostReplySnapshot(
+        originRec,
+        this.host.activeGateEntries().get(originKey)?.githubReply
+      ),
       originCoords: {
         platform: originCoordPlatform,
         channel: req.originChannel,
@@ -1490,6 +1516,8 @@ export class CollabCoordinator {
       /** §5.3: the caller's origin session, forwarded so the remote child can reply back — its
        *  OUTWARD id (§1.1), since it travels to another daemon. */
       originSessionId?: string
+      originCodeHostReplyTarget?: CodeHostReplyTarget | null
+      codeHostReplyTarget?: CodeHostReplyTarget | null
       /** The same session's logical key, for the gates this daemon keys by it. */
       originSessionKey?: string
       originCoords?: CallMeta['originCoords']
@@ -1538,6 +1566,10 @@ export class CollabCoordinator {
           // canonical read cursor — same guarantee as the same-daemon path.
           ...(req.transcriptTs !== undefined ? { transcriptTs: req.transcriptTs } : {}),
           ...(ctx.originSessionId !== undefined ? { originSessionId: ctx.originSessionId } : {}),
+          ...(ctx.originCodeHostReplyTarget !== undefined
+            ? { originCodeHostReplyTarget: ctx.originCodeHostReplyTarget }
+            : {}),
+          ...(ctx.codeHostReplyTarget !== undefined ? { codeHostReplyTarget: ctx.codeHostReplyTarget } : {}),
           ...(ctx.originCoords !== undefined ? { originCoords: ctx.originCoords } : {}),
           ...(ctx.externalOrigin !== undefined ? { externalOrigin: ctx.externalOrigin } : {}),
           ...(ctx.lineageReplyTo !== undefined ? { lineageReplyTo: ctx.lineageReplyTo } : {}),
